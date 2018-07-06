@@ -27,6 +27,8 @@ using Eigen::VectorXd;
 
 USING_NAMESPACE_QPOASES
 
+
+
 /*****************************************************************************
  * Configuracoes
  *****************************************************************************/
@@ -60,7 +62,7 @@ USING_NAMESPACE_QPOASES
 #define CONSTRAINTS_SIZE (( CONST_OUTPUTS_SIZE + INPUT_SIZE )*2*HORIZON_SIZE)
 
 // Tamanho do vetor de trajetoria desejada
-#define TRACK_SIZE ( CONST_OUTPUTS_SIZE*HORIZON_SIZE )
+#define TRACK_SIZE ( REG_OUTPUTS_SIZE*HORIZON_SIZE )
 
 // Quantidade de restrição incluindo:
 // - restrição no valor das entradas  INPUT_SIZE*HORIZON_SIZE*2
@@ -232,11 +234,11 @@ class MPC
     MatrixXd  F1;               /**< Gradiente do custo em relacao ao estado atual */
     MatrixXd  F2;               /**< Gradiente do custo em relacao a trajetoria desejada */
     MatrixXd  F3;               /**< Gradiente do custo em relacao ao comando desejado */
-    SQProblem *Solver_ptr;      /**< Ponteiro para um descritor do solver qpOASES */
+    QProblem Solver;      /**< Ponteiro para um descritor do solver qpOASES */
     VectorXd  _last_command;    /**< Último comando enviado */
     real_t  _cmd_ub_;           /**< Limiar superior do comando */
     real_t  _cmd_lb_;           /**< Limiar inferior do comando */
-    
+    qpOASES::Options Solver_options;
     public:
         /**
          * @breif Construtor
@@ -252,7 +254,7 @@ class MPC
          * @param[out] arg_sol informa o valor do comando encontrado como solucao
          */
         void get_next_command( double arg_steer, double arg_desired_yaw_rate, 
-                               VectorXd& arg_x, VectorXd& arg_sol );
+                               VectorXd * arg_x, VectorXd * arg_sol );
 };
 
 /*****************************************************************************
@@ -260,19 +262,6 @@ class MPC
  *****************************************************************************/
 MPC::MPC(void)
 {
-    int_t _nWSR_ = 200; //Maximo de iteracoes para resolver qp
-    VectorXd _B = VectorXd::Zero(BOUNDED_CONSTRAINTS_SIZE); //Limiar das restricoes Ap < _B
-    VectorXd _F = VectorXd::Zero(QP_SIZE); //Matriz gradiente da funcao custo J  = p'Hp + _F'p
-    //Valores virtuais do estado, comando e trajetoria desejada, para realizar primeira qp
-    const VectorXd _x = VectorXd::Zero(STATES_SIZE,1); 
-    const VectorXd _u = VectorXd::Zero(COMMAND_SIZE,1);
-    const VectorXd _track = VectorXd::Zero(TRACK_SIZE,1);
-    VectorXd _sol = VectorXd::Ones(QP_SIZE,1); //Solucao da primeira qp 
-    //Restrições impostas a solução da primeira qp
-    VectorXd _sol_lb(QP_SIZE);
-    VectorXd _sol_ub(QP_SIZE);
-
-    
     /****************************
      *Leitura dos arquivos .csv
      ***************************/
@@ -281,9 +270,9 @@ MPC::MPC(void)
         cout << "\r\n Erro ao ler H";
 
     cout << "\r\nA\r\n";
-    if( !get_matrix_from_csv(&A,A_ROWS,A_COLS,"A.csv") )
+    if( !get_matrix_from_csv(&A,A_ROWS,A_COLS,"A_CONSTRAINT.csv") )
         cout << "\r\n Erro ao ler A";
- 
+
     cout << "\r\nPI_E\r\n";
     if( !get_matrix_from_csv(&PI_E,PI_E_ROWS,PI_E_COLS,"PI_E.csv") )
         cout << "\r\n Erro ao ler PI_E";
@@ -319,43 +308,32 @@ MPC::MPC(void)
     cout << "\r\ncmd_ub\r\n";
     if( !get_value_from_csv(&_cmd_ub_,"cmd_ub.csv") )
         cout << "\r\n Erro ao ler cmd_ub";
+
+    cout << "\r\nub\r\n" <<_cmd_ub_;
+    cout << "\r\nlb\r\n" <<_cmd_lb_;
+   
+    MatrixXd transp;
     
-
-//    cout << "\r\nub\r\n" <<_cmd_ub_;
-//    cout << "\r\nlb\r\n" <<_cmd_lb_;
-
-    /****************************
-     *Configuracao e start do solver
-     ***************************/
-    _sol_lb << _cmd_lb_, _cmd_lb_, _cmd_lb_, 0;
-    _sol_ub << _cmd_ub_, _cmd_ub_, _cmd_ub_, 0;
-    _B.head(CONST_OUTPUTS_SIZE) = _G3.head(CONST_OUTPUTS_SIZE);
-
-
-    //Configura solver
-    Solver_ptr = new qpOASES::SQProblem(QP_SIZE,BOUNDED_CONSTRAINTS_SIZE);
+    transp = H.transpose();
+    H = transp;
+    transp = A.transpose();
+    A = transp;
     
-    
-    //Realiza primeira qp para comecar o solver
-    Solver_ptr->init( H.data(), _F.data(), A.data(), _sol_lb.data(), _sol_ub.data(), NULL, _B.data(), _nWSR_, 0, _sol.data());
-
-    //Obtem o resultado da primeira qp
-    Solver_ptr->getPrimalSolution(_sol.data());
-
     //Calcula o valor inicial do comando
-    _last_command = PI_E.block(0,0,COMMAND_SIZE,QP_SIZE)*_sol;
+    _last_command.setZero(1);
 }
 
 /*****************************************************************************
  * @brief Fornece o proximo valor do comando
  *****************************************************************************/
 void MPC::get_next_command( double arg_steer, double arg_desired_yaw_rate, 
-        VectorXd& arg_x,  VectorXd& arg_sol )
+        VectorXd * arg_x,  VectorXd * arg_sol )
 {
     VectorXd _B = VectorXd::Zero(BOUNDED_CONSTRAINTS_SIZE);
     VectorXd _F = VectorXd::Zero(QP_SIZE);
-    VectorXd _track = VectorXd::Ones(TRACK_SIZE,1)*arg_steer;
-    VectorXd _sol = VectorXd::Ones(QP_SIZE,1);
+    VectorXd _track = VectorXd::Ones(TRACK_SIZE,1)*arg_desired_yaw_rate;
+    static VectorXd _sol = VectorXd::Zero(QP_SIZE,1);
+    static VectorXd _sol2 = VectorXd::Zero(QP_SIZE,1);
     VectorXd _in_ub(INPUT_SIZE);
     VectorXd _in_lb(INPUT_SIZE);
     VectorXd _horizon_in_ub(INPUT_SIZE*HORIZON_SIZE);
@@ -363,10 +341,11 @@ void MPC::get_next_command( double arg_steer, double arg_desired_yaw_rate,
     VectorXd _desired_input(INPUT_SIZE);
     VectorXd _sol_lb(QP_SIZE);
     VectorXd _sol_ub(QP_SIZE);
-    int_t _nWSR_ = 200;
-   
+    int_t _nWSR_ = 20;
+    static bool first = 1;
 
- 
+
+
     //Comando sejado
     // comando controlado igual a zero e valor atual igual a ele mesmo
     _desired_input << 0, arg_steer; 
@@ -377,50 +356,99 @@ void MPC::get_next_command( double arg_steer, double arg_desired_yaw_rate,
     _in_ub << _cmd_ub_ , arg_steer;
     _in_lb << _cmd_lb_ , arg_steer;
     
+       
     //Expansão da restrição no horzionte de predição
     _horizon_in_ub = _in_ub.replicate(HORIZON_SIZE,1);
     _horizon_in_lb = _in_lb.replicate(HORIZON_SIZE,1);
-   
+
     //Restrição da solução com parametrezição exponencial
     //Parametros do comando controlado limitados aos limites do comando
     //Parametros da entrada nao controlada limitados ao seu valor atual
     _sol_lb << _cmd_lb_, _cmd_lb_, _cmd_lb_, arg_steer;
     _sol_ub << _cmd_ub_, _cmd_ub_, _cmd_ub_, arg_steer;
-    
 
      //Calcular limiar das restrições A * sol < _B
-     _B.head(CONSTRAINTS_SIZE) = G1*arg_x + G2*_last_command +_G3;
-    _B.segment(CONSTRAINTS_SIZE,INPUT_SIZE*HORIZON_SIZE) = -_horizon_in_lb;
-    _B.tail(INPUT_SIZE*HORIZON_SIZE) = _horizon_in_ub;
+     _B.head(CONSTRAINTS_SIZE) = G1*(*arg_x) + G2*_last_command + _G3;
+       
+     _B.segment(CONSTRAINTS_SIZE,INPUT_SIZE*HORIZON_SIZE) = -_horizon_in_lb;
+     
+     _B.tail(INPUT_SIZE*HORIZON_SIZE) = _horizon_in_ub;
 
-
+    //cout << "\r\n" << _B;
     //Calcula gradiente da função custo
-    _F =  PI_E.transpose()*(F1*arg_x + F2*_track + F3*_desired_input);
+    _F = F1*(*arg_x)+ F2*_track + F3*_desired_input;
+    _F = PI_E.transpose()*_F;
 
-    //Realiza qp
-    Solver_ptr->hotstart(_F.data(),_sol_lb.data(),_sol_ub.data(),NULL,_B.data(),_nWSR_, 0 );
+    static bool error = 0;
+   
     
+    //Realiza qp
+    if( first )
+    {
+
+        Solver=qpOASES::QProblem( QP_SIZE, BOUNDED_CONSTRAINTS_SIZE );
+        Solver_options.printLevel = qpOASES::PL_LOW;
+        Solver.setOptions(Solver_options);
+        Solver.init( H.data(), _F.data(), A.data(), _sol_lb.data(), _sol_ub.data(), NULL, _B.data(), _nWSR_ );
+        first = 0;
+    }
+    else  
+    {
+         if ( Solver.hotstart(_F.data(),_sol_lb.data(),_sol_ub.data(),NULL,_B.data(),_nWSR_ ) 
+                 == RET_HOTSTART_STOPPED_INFEASIBILITY )
+             error = 1;
+    }
+
+
     //Le o resultado da qp
-    Solver_ptr->getPrimalSolution(_sol.data());
+    Solver.getPrimalSolution(_sol.data());
 
 
-    cout << "\r\nsol\r\n" << _sol;
+    //cout << "\r\nsol\r\n" << _sol;
     _last_command = PI_E.block(0,0,COMMAND_SIZE,QP_SIZE)*_sol;
-    arg_sol = _last_command;
+    *arg_sol = _last_command;
 }
 
 int main()
 {
    MPC mpc;
    VectorXd _x = VectorXd::Zero(STATES_SIZE);
-   VectorXd _sol;
+   VectorXd _sol(COMMAND_SIZE);
+   MatrixXd A(STATES_SIZE,STATES_SIZE);
+   MatrixXd B(STATES_SIZE,INPUT_SIZE);
+   MatrixXd steer(37501,2);
+   VectorXd _desired_yaw_rate;
+   const real_t _long_speed_ = 80/3.6;
+   const real_t _Ku_ = 0.06;
+   const real_t _l_ = 2.69;   
+   VectorXd _input(2);
 
-   cout << "init ok\r\n";
 
-   for( int i=0; i< 1000; i++ )
+   cout << "\r\ndA";
+   if( !get_matrix_from_csv( &A, STATES_SIZE, STATES_SIZE, "dA.csv" ) )
+       cout << "\r\n erro ao ler matriz dA";
+  
+
+   cout << "\r\ndB";
+   if( !get_matrix_from_csv( &B, STATES_SIZE, INPUT_SIZE, "dB.csv" ) )
+       cout << "\r\n erro ao ler matriz dB";
+  
+   
+   cout << "\r\nsteer";
+   if( !get_matrix_from_csv( &steer, 37501, 2, "steer.csv" ) )
+       cout << "\r\n erro ao ler matriz steer";
+ 
+   _desired_yaw_rate = steer.col(1)*(_long_speed_/(_l_ + _Ku_*_l_*_long_speed_*_long_speed_));
+   
+   ofstream fcout("result.csv");
+   
+   for( int i=0; i<37501; i++ )
    {
-        mpc.get_next_command( 1e-12, 1e-12, _x, _sol );
-        cout << "\r\nfinal sol\r\n" << _sol;
+
+        mpc.get_next_command( steer(i,1), _desired_yaw_rate(i), &_x, &_sol );
+        _input << _sol, steer(i,1);
+        _x = A*_x + B*_input;
+        fcout << "\r\n" << steer(i,0) << "," << steer(i,1) << "," << _desired_yaw_rate(i) << "," << _x(0) << "," << _x(1) << "," << _x(2) << "," << _x(3) << "," << _sol(0);
    }
 
 }
